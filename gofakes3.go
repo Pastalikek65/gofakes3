@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -29,6 +30,7 @@ type GoFakeS3 struct {
 
 	storage   Backend
 	versioned VersionedBackend
+	multipart MultipartBackend // nil if storage does not implement MultipartBackend
 
 	timeSource              TimeSource
 	timeSkew                time.Duration
@@ -60,6 +62,7 @@ func New(backend Backend, options ...Option) *GoFakeS3 {
 
 	// versioned MUST be set before options as one of the options disables it:
 	s3.versioned, _ = backend.(VersionedBackend)
+	s3.multipart, _ = backend.(MultipartBackend)
 
 	for _, opt := range options {
 		opt(s3)
@@ -908,9 +911,31 @@ func (g *GoFakeS3) initiateMultipartUpload(bucket, object string, w http.Respons
 		return err
 	}
 
-	upload := g.uploader.Begin(bucket, object, meta, g.timeSource.Now())
+	var uploadID UploadID
+	if g.multipart != nil {
+		id, err := g.multipart.CreateMultipartUpload(r.Context(), bucket, object, meta)
+		switch {
+		case err == nil:
+			if _, err := g.uploader.BeginStreaming(id, bucket, object, meta, g.timeSource.Now()); err != nil {
+				// Backend returned a colliding UploadID. Tell it to drop
+				// the upload it just created so we do not leak state.
+				_ = g.multipart.AbortMultipartUpload(r.Context(), bucket, object, id)
+				return err
+			}
+			uploadID = id
+		case errors.Is(err, ErrMultipartUploadNotSupported):
+			// fall through to in-memory uploader
+		default:
+			return err
+		}
+	}
+	if uploadID == "" {
+		upload := g.uploader.Begin(bucket, object, meta, g.timeSource.Now())
+		uploadID = upload.ID
+	}
+
 	out := InitiateMultipartUpload{
-		UploadID: upload.ID,
+		UploadID: uploadID,
 		Bucket:   bucket,
 		Key:      object,
 	}
@@ -993,6 +1018,18 @@ func (g *GoFakeS3) putMultipartUploadPart(bucket, object string, uploadID Upload
 		}
 	}
 
+	if upload.streaming {
+		etag, err := g.multipart.UploadPart(r.Context(), bucket, object, uploadID, int(partNumber), size, rdr)
+		if err != nil {
+			return err
+		}
+		if err := upload.AddStreamingPart(int(partNumber), g.timeSource.Now(), size, etag); err != nil {
+			return err
+		}
+		w.Header().Add("ETag", etag)
+		return nil
+	}
+
 	body, err := ReadAll(rdr, size)
 	if err != nil {
 		return err
@@ -1019,6 +1056,17 @@ func isChunkedStreamingPayload(value string) bool {
 
 func (g *GoFakeS3) abortMultipartUpload(bucket, object string, uploadID UploadID, w http.ResponseWriter, r *http.Request) error {
 	g.log.Print(LogInfo, "abort multipart upload", bucket, object, uploadID)
+	upload, err := g.uploader.Get(bucket, object, uploadID)
+	if err != nil {
+		return err
+	}
+	if upload.streaming {
+		if err := g.multipart.AbortMultipartUpload(r.Context(), bucket, object, uploadID); err != nil {
+			return err
+		}
+	}
+	// Consume from the uploader only after the backend has acknowledged the
+	// abort, so a backend error leaves the upload available for retry.
 	if _, err := g.uploader.Complete(bucket, object, uploadID); err != nil {
 		return err
 	}
@@ -1034,9 +1082,29 @@ func (g *GoFakeS3) completeMultipartUpload(bucket, object string, uploadID Uploa
 		return err
 	}
 
-	upload, err := g.uploader.Complete(bucket, object, uploadID)
+	upload, err := g.uploader.Get(bucket, object, uploadID)
 	if err != nil {
 		return err
+	}
+
+	if upload.streaming {
+		versionID, etag, err := g.multipart.CompleteMultipartUpload(r.Context(), bucket, object, uploadID, &in)
+		if err != nil {
+			return err
+		}
+		// Consume from the uploader only after the backend has acknowledged
+		// completion, so a backend error leaves the upload available for retry.
+		if _, err := g.uploader.Complete(bucket, object, uploadID); err != nil {
+			return err
+		}
+		if versionID != "" {
+			w.Header().Set("x-amz-version-id", string(versionID))
+		}
+		return g.xmlEncoder(w).Encode(&CompleteMultipartUploadResult{
+			ETag:   etag,
+			Bucket: bucket,
+			Key:    object,
+		})
 	}
 
 	fileBody, etag, err := upload.Reassemble(&in)
@@ -1046,6 +1114,10 @@ func (g *GoFakeS3) completeMultipartUpload(bucket, object string, uploadID Uploa
 
 	result, err := g.storage.PutObject(r.Context(), bucket, object, upload.Meta, bytes.NewReader(fileBody), int64(len(fileBody)))
 	if err != nil {
+		return err
+	}
+	// Consume from the uploader only after PutObject has succeeded.
+	if _, err := g.uploader.Complete(bucket, object, uploadID); err != nil {
 		return err
 	}
 	if result.VersionID != "" {
