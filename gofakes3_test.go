@@ -1400,3 +1400,60 @@ func TestGetObjectResponseOverride(t *testing.T) {
 		}
 	})
 }
+
+func TestUploadPartCopy(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.Close()
+	ctx := context.Background()
+	svc := ts.s3Client()
+
+	content := "source data for the multipart part copy\n"
+	ts.backendPutString(defaultBucket, "src-key", nil, content)
+
+	uploadID := ts.createMultipartUpload(defaultBucket, "dst-key", nil)
+
+	part, err := svc.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+		Bucket:     aws.String(defaultBucket),
+		Key:        aws.String("dst-key"),
+		UploadId:   aws.String(uploadID),
+		PartNumber: aws.Int32(1),
+		CopySource: aws.String("/" + defaultBucket + "/src-key"),
+	})
+	ts.OK(err)
+	if part.CopyPartResult == nil || part.CopyPartResult.ETag == nil || *part.CopyPartResult.ETag == "" {
+		t.Fatal("UploadPartCopy did not return a CopyPartResult with an ETag")
+	}
+
+	ts.assertCompleteUpload(defaultBucket, "dst-key", uploadID, []types.CompletedPart{
+		{PartNumber: aws.Int32(1), ETag: part.CopyPartResult.ETag},
+	}, content)
+}
+
+func TestUploadPartCopyRange(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.Close()
+	ctx := context.Background()
+	svc := ts.s3Client()
+
+	content := "0123456789abcdefgh"
+	ts.backendPutString(defaultBucket, "src-key", nil, content)
+
+	uploadID := ts.createMultipartUpload(defaultBucket, "dst-key", nil)
+
+	part, err := svc.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+		Bucket:          aws.String(defaultBucket),
+		Key:             aws.String("dst-key"),
+		UploadId:        aws.String(uploadID),
+		PartNumber:      aws.Int32(1),
+		CopySource:      aws.String("/" + defaultBucket + "/src-key"),
+		CopySourceRange: aws.String("bytes=4-9"),
+	})
+	ts.OK(err)
+	if part.CopyPartResult == nil || part.CopyPartResult.ETag == nil || *part.CopyPartResult.ETag == "" {
+		t.Fatal("UploadPartCopy did not return a CopyPartResult with an ETag")
+	}
+
+	ts.assertCompleteUpload(defaultBucket, "dst-key", uploadID, []types.CompletedPart{
+		{PartNumber: aws.Int32(1), ETag: part.CopyPartResult.ETag},
+	}, "456789")
+}
