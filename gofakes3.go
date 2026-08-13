@@ -958,6 +958,18 @@ func (g *GoFakeS3) putMultipartUploadPart(bucket, object string, uploadID Upload
 		return ErrInvalidPart
 	}
 
+	// An UploadPartCopy request carries no body: the part is copied
+	// server-side from an existing object instead. Handle it before any
+	// body/size parsing, which would otherwise fail on a request without a
+	// Content-Length header.
+	if r.Header.Get("X-Amz-Copy-Source") != "" {
+		upload, err := g.uploader.Get(bucket, object, uploadID)
+		if err != nil {
+			return err
+		}
+		return g.copyMultipartUploadPart(upload, partNumber, r, w)
+	}
+
 	size, err := strconv.ParseInt(r.Header.Get("Content-Length"), 10, 64)
 	if err != nil {
 		return ErrMissingContentLength
@@ -977,13 +989,6 @@ func (g *GoFakeS3) putMultipartUploadPart(bucket, object string, uploadID Upload
 	meta, err := metadataHeaders(r.Header, g.timeSource.Now(), g.metadataSizeLimit)
 	if err != nil {
 		return err
-	}
-
-	// An UploadPartCopy request carries no body: the part is copied
-	// server-side from an existing object instead. Handle it before any
-	// body/size parsing, which would otherwise see an empty body.
-	if _, ok := meta["X-Amz-Copy-Source"]; ok {
-		return g.copyMultipartUploadPart(upload, partNumber, meta, w, r)
 	}
 
 	var rdr io.Reader
@@ -1038,8 +1043,8 @@ func (g *GoFakeS3) putMultipartUploadPart(bucket, object string, uploadID Upload
 // copyMultipartUploadPart implements UploadPartCopy: the part is copied
 // server-side from an existing object (optionally a range of it) into the
 // given multipart upload, instead of being streamed by the client.
-func (g *GoFakeS3) copyMultipartUploadPart(upload *multipartUpload, partNumber int64, meta map[string]string, w http.ResponseWriter, r *http.Request) (err error) {
-	source := meta["X-Amz-Copy-Source"]
+func (g *GoFakeS3) copyMultipartUploadPart(upload *multipartUpload, partNumber int64, r *http.Request, w http.ResponseWriter) (err error) {
+	source := r.Header.Get("X-Amz-Copy-Source")
 	g.log.Print(LogInfo, "copy multipart upload part", source, "TO", upload.Bucket, upload.Object)
 
 	srcBucket, srcKey, err := splitCopySource(source)
@@ -1084,10 +1089,6 @@ func (g *GoFakeS3) copyMultipartUploadPart(upload *multipartUpload, partNumber i
 		return err
 	}
 
-	// S3 returns 206 Partial Content when a range was copied.
-	if copyRange != nil {
-		w.WriteHeader(http.StatusPartialContent)
-	}
 	return g.xmlEncoder(w).Encode(&CopyPartResult{
 		ETag:         etag,
 		LastModified: NewContentTime(g.timeSource.Now()),
